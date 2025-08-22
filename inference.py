@@ -1,9 +1,9 @@
 import argparse, os, random, re, json, types
 import torch, numpy as np, cv2
 from PIL import Image
-from my_ddim_dynamic_random_mask import DDIMScheduler
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint_dynamic_anomaly_strength import \
-     StableDiffusionInpaintPipeline_dynamic
+from magic_ddim import DDIMScheduler
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint_magic import \
+    StableDiffusionInpaintPipeline_magic
 
 
 def parse_args():
