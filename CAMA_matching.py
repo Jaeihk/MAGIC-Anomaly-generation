@@ -1,3 +1,27 @@
+"""
+Memory-efficient correspondence extractor
+(top-bottom + center version, line∩object-mask search, line-viz save)
+------------------------------------------------------------------
+* Best points from top and bottom → line mask
+* Within the intersection with the object mask in train/masks,
+  select the final best point as the highest value in the
+  'center-point similarity map'.
+──────────────────────────────────────────────────────────────────
+(2025-07-08) **Update**
+  • Split the GT mask into connected components (islands) and
+    compute center and 4-way points for each island.
+  • Record defect image filename and component index
+    (“region_idx”) in JSON.
+(2025-07-09) **SPEED-MOD**
+  • Cache defect features / up·down·center vectors on GPU at once.
+  • Compute (K×H×W) similarity maps in batch with torch.einsum.
+  • Extract features for normals in mini-batches.
+  • Save JSON every 20 items only.
+"""
+
+###############################################################################
+# 0) Required: handle GPU id (--gpu) + prevent CUDA memory fragmentation
+###############################################################################
 import os, sys, argparse, random, gc
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -8,6 +32,7 @@ cli.add_argument("--out_dir",       required=True)
 cli.add_argument("--mask_root",     required=True)
 cli.add_argument("--categories",    nargs="+", required=True)
 cli.add_argument("--batch", type=int, default=8, help="batch size for normal images")  # SPEED-MOD
+cli.add_argument("--img_size", type=int, default=512, help="square image size (default: 512)") 
 args, _ = cli.parse_known_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
@@ -160,7 +185,7 @@ def split_mask_to_regions(mask_np, min_area=50):
 def generate_correspondence_json(
     mvtecad_dir,
     categories,
-    img_size=480,
+    img_size=512,  # << 512 기준
     out_dir="output",
     out_json_name="matching_result_center.json",
     viz_dir_name="matched_visuals_line",
@@ -170,6 +195,7 @@ def generate_correspondence_json(
     os.makedirs(out_dir, exist_ok=True)
     viz_dir  = os.path.join(out_dir, viz_dir_name);           os.makedirs(viz_dir, exist_ok=True)
     line_dir = os.path.join(out_dir, viz_dir_name + "_line"); os.makedirs(line_dir, exist_ok=True)
+    overlay_dir = os.path.join(out_dir, viz_dir_name + "_overlay"); os.makedirs(overlay_dir, exist_ok=True)
     out_json_path = os.path.join(out_dir, out_json_name)
 
     # open debug log file
@@ -179,6 +205,7 @@ def generate_correspondence_json(
     _log(dbg_fh, f"[Args] mask_root={mask_root}")
     _log(dbg_fh, f"[Args] categories={categories}")
     _log(dbg_fh, f"[Args] batch={batch}")
+    _log(dbg_fh, f"[Args] img_size={img_size}")
     _log(dbg_fh, f"[Info] Using device: {device}")
 
     result = {}
@@ -344,21 +371,42 @@ def generate_correspondence_json(
                             os.path.join(mask_root, cat, "train", "masks", f"{base_img}.png"),
                         ]
 
-                    obj_path = next((p for p in cand if os.path.exists(p)), None)
+                    obj_path = next((p for p in cand if os.path.isfile(p)), None)
+
+                    # ──────────────── obj_path sanity check ────────────────
                     if obj_path is None:
                         batch_missing_mask += 1
-                        # For the first few, leave which paths were tried in the debug file
-                        _log(dbg_fh, f"[MISS-MASK][{cat}] {base_img} | tried: {cand[0]} || {cand[1]}")
-                        obj_masks.append(None); imgs_pil.append(None)
-                        continue
-                    obj_np = np.array(
-                        Image.open(obj_path).convert("L")
-                        .resize((img_size, img_size), Image.NEAREST)
-                    )
+                        _log(dbg_fh,
+                             f"[MISS-MASK][{cat}] {base_img} | tried: {cand[0]} || {cand[1]}")
+                        raise FileNotFoundError(
+                            f"Object mask not found for '{cat}/{base_img}'. "
+                            f"Tried:\n  - {cand[0]}\n  - {cand[1]}\n"
+                            f"Check --mask_root='{mask_root}' and file names."
+                        )
+                    try:
+                        if os.path.getsize(obj_path) == 0:
+                            raise OSError("file size is 0")
+                        with Image.open(obj_path) as _im_chk:
+                            _im_chk.verify()
+                    except Exception as e:
+                        _log(dbg_fh,
+                             f"[ERROR-MASK][{cat}] Invalid mask file: {obj_path} | {e}")
+                        raise FileNotFoundError(
+                            f"Invalid or corrupted mask file: {obj_path} ({e})"
+                        )
+                    # ────────────────────────────────────────────────────────
+
+                    # >>> FIX: mask resize same as image (keep_ratio+pad)
+                    # 원본 마스크 크기/비율을 보존한 채로 정사각형 패딩하여 img_size×img_size로 만듭니다. (default: 512×512)
+                    obj_pil_orig = Image.open(obj_path).convert("L")
+                    obj_pil_resz = resize(obj_pil_orig, img_size, True, True)
+                    obj_np = np.array(obj_pil_resz)
+
                     if (obj_np > 127).sum() == 0:
                         batch_empty_mask += 1
                         obj_masks.append(None); imgs_pil.append(None)
                         continue
+
                     obj_masks.append(torch.from_numpy(obj_np > 127).to(device))
                     imgs_pil.append(
                         resize(Image.open(npath).convert("RGB"),
@@ -420,7 +468,12 @@ def generate_correspondence_json(
                         bx_final = int(best_idx % img_size)
                         by_final = int(best_idx // img_size)
 
-                        # ─ visualization
+                        # ─ ASSERT: best point must lie inside obj_mask
+                        assert bool(obj_mask[by_final, bx_final].item()), \
+                            (f"Chosen point ({bx_final},{by_final}) is outside obj_mask. "
+                             f"cat={cat}, cls={dcls}, img={bn}, k={k}")
+
+                        # ─ visualization (original)
                         ann  = img_norm.copy()
                         draw = ImageDraw.Draw(ann)
                         for p in [up_pt, dn_pt]:
@@ -432,6 +485,26 @@ def generate_correspondence_json(
                                      fill="red", outline="red")
                         vis_name = f"{cat}_{dcls}__{bn}_cmp{k}_best.png"
                         ann.save(os.path.join(viz_dir, vis_name))
+
+                        # ─ visualization (overlay: mask contour in green + line in blue)
+                        ann_cv = cv2.cvtColor(np.array(img_norm), cv2.COLOR_RGB2BGR)
+                        obj_np_vis = (obj_mask.detach().to("cpu").numpy().astype(np.uint8) * 255)
+                        contours, _ = cv2.findContours(obj_np_vis, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        cv2.drawContours(ann_cv, contours, -1, (0, 255, 0), 1)    # green
+                        cv2.line(ann_cv, up_pt, dn_pt, (255, 0, 0), 1)              # blue line
+
+                        ann_overlay = Image.fromarray(cv2.cvtColor(ann_cv, cv2.COLOR_BGR2RGB))
+                        draw_ov = ImageDraw.Draw(ann_overlay)
+                        for p in [up_pt, dn_pt]:
+                            draw_ov.ellipse([(p[0]-4, p[1]-4),
+                                             (p[0]+4, p[1]+4)],
+                                            fill="blue", outline="blue")
+                        draw_ov.ellipse([(bx_final-5, by_final-5),
+                                         (bx_final+5, by_final+5)],
+                                        fill="red", outline="red")
+
+                        overlay_name = f"{cat}_{dcls}__{bn}_cmp{k}_best_overlay.png"
+                        ann_overlay.save(os.path.join(overlay_dir, overlay_name))
 
                         defect_img, region_idx = defect_ids[k]
                         result[cat][dcls].append({
@@ -469,6 +542,7 @@ def generate_correspondence_json(
     _log(dbg_fh, f"\n[FINAL] JSON saved to {out_json_path}")
     _log(dbg_fh, f"[FINAL] Visualizations saved to {viz_dir}")
     _log(dbg_fh, f"[FINAL] Line visualizations saved to {line_dir}")
+    _log(dbg_fh, f"[FINAL] Overlay visualizations saved to {overlay_dir}")
     _log(dbg_fh, f"[TOTAL] components(K)={grand_total_components} | "
                  f"results={grand_total_results} | "
                  f"no_intersections={grand_no_intersections} | "
@@ -483,7 +557,8 @@ if __name__ == "__main__":
     generate_correspondence_json(
         mvtecad_dir=args.mvtecad_dir,
         categories=args.categories,
-        img_size=480,
+        img_size=args.img_size,  
         out_dir=args.out_dir,
         mask_root=args.mask_root,
     )
+
