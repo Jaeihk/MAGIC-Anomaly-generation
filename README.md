@@ -124,12 +124,14 @@ python inference.py \
   --defect_json /path/to/defect_classification.json \
   --match_json /path/to/matching_result.json \
   --normal_masks /obj_foreground_mask \
+  --gsi_use_schedule \
   --mask_dir /anomaly_mask \
-  --anomaly_stop_step 20 \
+  --gsi_schedule cosine \
+  --gsi_min 4.0 \
+  --gsi_max 7.5 \
+  --guidance_scale_outside 7.5 \
   --CAMA \
   --base_dir /path/to/mvtec_ad \
-  --anomaly_strength_min 0.0 \
-  --anomaly_strength_max 0.6
 ```
 
 ---
@@ -190,6 +192,8 @@ This code is licensed for **academic research and non-commercial use only**.
 - This work is licensed under the Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0) License. See https://creativecommons.org/licenses/by-nc/4.0/ for details.
 
 © Jae Hyuck Choi, 2025
+
+
 
 
 
