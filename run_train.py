@@ -58,6 +58,7 @@ def main():
                 f"--text_noise_scale={args.text_noise_scale} "
                 f"--mvtecad "
                 f'--mask_data_dir="{mask_data_dir}" '
+                f"--center_crop "
             )
 
             print(f"Running command for category '{category}', defect '{defect}'.")
@@ -66,3 +67,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
