@@ -5,13 +5,11 @@ from magic_ddim import DDIMScheduler
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint_dynamic_anomaly_strength_guidance_scheduler_up import \
      StableDiffusionInpaintPipeline_dynamic
 import glob
-from diffusers.configuration_utils import FrozenDict   # ★ NEW: scheduler config 주입용
+from diffusers.configuration_utils import FrozenDict 
 from torchvision import transforms
 
-# 고정 해상도 (학습과 동일하게 512)
 RESOLUTION = 512
 
-# 학습 때와 동일한 Resize + CenterCrop
 image_resize_center_crop = transforms.Compose(
     [
         transforms.Resize(RESOLUTION, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -32,7 +30,7 @@ mask_resize_center_crop = transforms.Compose(
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Inference-time mask-alignment augmentation.")
-    # ───────── 기존 인자 유지 ─────────
+    # ───────── Keep existing arguments ─────────
     parser.add_argument("--defect_json", required=True)
     parser.add_argument("--match_json",  required=True)
     parser.add_argument("--model_ckpt_root", required=True)
@@ -52,17 +50,17 @@ def parse_args():
     parser.add_argument("--use_random_mask", action="store_true")
     parser.add_argument("--dataset_type", choices=["mvtec_3d", "mvtec","visa","DAGM"],
                         default="mvtec_3d",
-                        help="mvtec_3d: MVTEC-3D Anomaly, mvtec: MVTEC-AD 2-D")
+                        help="mvtec_3d: MVTec-3D Anomaly, mvtec: MVTec-AD 2-D")
     parser.add_argument("--eta", type=float, default=0.0,
-                        help="DDIM eta (0~1). DDIM 스케줄러에서만 사용되고, 다른 스케줄러는 무시됩니다.")
+                        help="DDIM eta (0–1). Used only for DDIM scheduler; ignored by other schedulers.")
     parser.add_argument("--eta_mask_max", type=float, default=0.0,
-                        help="마스크 내부 eta_max(스케줄 사용 시 상한).")
+                        help="eta_max inside the mask (upper bound when using a schedule).")
     parser.add_argument("--eta_mask_min", type=float, default=0.0,
-                        help="마스크 내부 eta_min(스케줄 사용 시 하한).")
+                        help="eta_min inside the mask (lower bound when using a schedule).")
 
-    # ───────── NEW: eta_mask 스케줄러/가드 하이퍼들(DDIM 내부에 전달) ─────────
+    # ───────── NEW: eta_mask scheduler / guard hyperparameters (passed into DDIM) ─────────
     parser.add_argument("--eta_mask_use_schedule", action="store_true",
-                        help="True면 DDIM이 내부 스텝 스케줄을 사용(eta_mask 인자는 무시).")
+                        help="If True, DDIM uses an internal step-wise schedule (eta_mask arguments are ignored).")
     parser.add_argument("--eta_mask_schedule",
                         choices=["constant","linear_down","linear_up",
                                  "cosine_down","cosine_up",
@@ -71,43 +69,50 @@ def parse_args():
                                  "sigmoid_down","sigmoid_up"],
                         default="constant")
     parser.add_argument("--eta_mask_power", type=float, default=2.0,
-                        help="poly 스케줄 지수 p")
+                        help="Exponent p for polynomial schedule.")
     parser.add_argument("--eta_mask_exp_k", type=float, default=3.0,
-                        help="exp 스케줄 상수 k")
+                        help="Constant k for exponential schedule.")
     parser.add_argument("--eta_mask_sigmoid_k", type=float, default=8.0,
-                        help="sigmoid 스케줄 경사 k")
+                        help="Slope parameter k for sigmoid schedule.")
     parser.add_argument("--eta_mask_segmented", action="store_true",
-                    help="양수(허용) 구간에서만 스케줄을 s∈[0,1]로 재매핑(구간 시작=max, 끝=0).")
+                        help="Remap the schedule to s∈[0,1] only over the positive (valid) interval "
+                             "(interval start=max, end=0).")
     parser.add_argument("--eta_mask_guard",
                         choices=["none","clip_to_crit","zero_before_neg"],
                         default="none",
-                        help="임계치 가드 모드")
+                        help="Critical-threshold guard mode.")
     parser.add_argument("--eta_mask_guard_margin", type=float, default=0.99,
-                        help="임계치 대비 여유(예: 0.99)")
+                        help="Safety margin relative to the critical threshold (e.g., 0.99).")
 
-    # ───────── 기존 CFG 스칼라 인자 (기본값 유지) ─────────
+    # ───────── Existing CFG scalar arguments (keep default behavior) ─────────
     parser.add_argument("--guidance_scale_inside", type=float, default=None,
-                        help="마스크 안쪽 guidance scale (미지정 시 pipeline의 global guidance_scale 사용)")
+                        help="Guidance scale inside the mask (if not set, use pipeline global guidance_scale).")
     parser.add_argument("--guidance_scale_outside", type=float, default=None,
-                        help="마스크 바깥 guidance scale (미지정 시 pipeline의 global guidance_scale 사용)")
+                        help="Guidance scale outside the mask (if not set, use pipeline global guidance_scale).")
 
-    # ───────── NEW: guidance_scale_inside 스케줄링/샘플링 컨트롤 ─────────
+    # ───────── NEW: guidance_scale_inside scheduling / sampling control ─────────
     parser.add_argument("--gsi_use_schedule", action="store_true",
-                        help="True면 guidance_scale_inside를 스텝별 스케줄(max→min)로 사용")
+                        help="If True, use guidance_scale_inside as a step-wise schedule (max → min).")
     parser.add_argument("--gsi_schedule",
                         choices=["constant","linear","linear_down","cosine","cosine_down",
                                  "poly","poly_down","exp","exp_down","sigmoid","sigmoid_down"],
                         default="linear",
-                        help="선택 시 max→min으로 감소하는 스케줄")
-    parser.add_argument("--gsi_min", type=float, default=None, help="guidance_scale_inside 하한")
-    parser.add_argument("--gsi_max", type=float, default=None, help="guidance_scale_inside 상한")
-    parser.add_argument("--gsi_power", type=float, default=2.0, help="poly 스케줄 지수")
-    parser.add_argument("--gsi_exp_k", type=float, default=3.0, help="exp 스케줄 k")
-    parser.add_argument("--gsi_sigmoid_k", type=float, default=8.0, help="sigmoid 스케줄 k")
+                        help="Selected schedule decreases from max to min.")
+    parser.add_argument("--gsi_min", type=float, default=None,
+                        help="Lower bound for guidance_scale_inside.")
+    parser.add_argument("--gsi_max", type=float, default=None,
+                        help="Upper bound for guidance_scale_inside.")
+    parser.add_argument("--gsi_power", type=float, default=2.0,
+                        help="Exponent for polynomial schedule.")
+    parser.add_argument("--gsi_exp_k", type=float, default=3.0,
+                        help="k parameter for exponential schedule.")
+    parser.add_argument("--gsi_sigmoid_k", type=float, default=8.0,
+                        help="k parameter for sigmoid schedule.")
     parser.add_argument("--gsi_sample_per_step", action="store_true",
-                        help="스케줄을 쓰지 않는 경우 [gsi_min,gsi_max]에서 스텝별 샘플링")
+                        help="If not using a schedule, sample per step from [gsi_min, gsi_max].")
 
     return parser.parse_args()
+
 
 args = parse_args()
 
@@ -146,7 +151,7 @@ def inpaint(pipe, image, prompt, mask=None, n_samples=4, device="cuda",
             anomaly_strength=0.0, anomaly_stop_step=999999, eta_mask_stop_step=999999,
             eta=0.0, eta_mask=0.0,
             guidance_scale_inside=None, guidance_scale_outside=None,
-            # NEW: inside 스케줄/샘플링 옵션 전달
+            # NEW: inside 
             gsi_use_schedule=False, gsi_schedule="linear",
             gsi_min=None, gsi_max=None,
             gsi_power=2.0, gsi_exp_k=3.0, gsi_sigmoid_k=8.0,
@@ -161,7 +166,6 @@ def inpaint(pipe, image, prompt, mask=None, n_samples=4, device="cuda",
     else:
         mask_pil = mask.convert("RGB") if mask.mode != "RGB" else mask
 
-    # (프로젝트에 이미 구현돼 있다면) 블러 적용
     mask_pil = pipe.mask_processor.blur(mask_pil, blur_factor=blur_factor)
 
     return pipe(
@@ -175,11 +179,9 @@ def inpaint(pipe, image, prompt, mask=None, n_samples=4, device="cuda",
         eta=eta,
         eta_mask=eta_mask,
 
-        # 기존/NEW 인자 전달
         guidance_scale_inside=guidance_scale_inside,
         guidance_scale_outside=guidance_scale_outside,
 
-        # NEW: inside 스케줄/샘플링 파라미터
         gsi_use_schedule=gsi_use_schedule,
         gsi_schedule=gsi_schedule,
         guidance_scale_inside_min=gsi_min,
@@ -275,7 +277,6 @@ def CAMA(
     for it in match_data.get(category, {}).get(defect_class, []):
         if it["normal_img"] != base_normal:
             continue
-        # 이제 JSON의 best_x, best_y가 이미 512x512 기준이므로 그대로 사용
         by_defect.setdefault(it["defect_img"], []).append((it["best_x"], it["best_y"]))
 
     if not by_defect:
@@ -304,10 +305,9 @@ def CAMA(
     def rand_point_inside(mask):
         ys, xs = np.where(mask > 0)
         if ys.size == 0:
-            # If obj_mask is empty, sample from the whole image (이미 512 기준)
+            # If obj_mask is empty, sample from the whole image
             return random.randint(0, W - 1), random.randint(0, H - 1)
         idx = random.randrange(ys.size)
-        # 좌표도 그대로 (512 기준)
         return int(xs[idx]), int(ys[idx])
 
     if n_coords >= n_comp:
@@ -324,7 +324,6 @@ def CAMA(
 
     shifted = np.zeros_like(code_mask_bin, np.uint8)
     for lbl, (best_x, best_y) in target_pairs:
-        # JSON과 랜덤 모두 512 좌표이므로 그대로 사용
         best_x = int(round(best_x))
         best_y = int(round(best_y))
 
@@ -425,10 +424,8 @@ def main():
 
             pipe = StableDiffusionInpaintPipeline_dynamic.from_pretrained(
                 ckpt_root, torch_dtype=torch.float16)
-            # --- DDIM 스케줄러 로드
             pipe.scheduler = DDIMScheduler.from_pretrained(args.ddim_scheduler_root)
 
-            # --- ★ parser에서 받은 eta_mask 스케줄/가드 하이퍼들을 DDIM config에 주입
             sched = pipe.scheduler
             new_cfg = dict(sched.config)
             new_cfg.update({
@@ -442,7 +439,6 @@ def main():
                 "eta_mask_guard": args.eta_mask_guard,
                 "eta_mask_guard_margin": float(args.eta_mask_guard_margin),
                 "eta_mask_segmented": bool(args.eta_mask_segmented),
-                # 스케줄 on일 때도 stop step을 존중하기 위해 DDIM에 전달
                 "eta_mask_stop_step": int(args.eta_mask_stop_step),
             })
             sched._internal_dict = FrozenDict(new_cfg)
@@ -491,7 +487,6 @@ def main():
                     obj_mask_pil = mask_resize_center_crop(obj_mask_pil)
                     obj_mask = (np.array(obj_mask_pil) > 127).astype(np.uint8)
 
-                # 그래도 혹시 shape 안 맞으면 한번 더 맞춰줌
                 if obj_mask.shape != mask_np.shape:
                     obj_mask = cv2.resize(obj_mask, mask_np.shape[::-1], interpolation=cv2.INTER_NEAREST)
                     obj_mask = (obj_mask > 0).astype(np.uint8)
@@ -511,7 +506,6 @@ def main():
                 final_mask_pil = Image.fromarray((final_mask * 255).astype(np.uint8))
 
                 a_strength = random.uniform(args.anomaly_strength_min, args.anomaly_strength_max)
-                # NOTE: 스케줄 on이면 아래 eta_strength는 DDIM에서 무시됨(내부 스케줄 사용)
                 eta_strength = random.uniform(args.eta_mask_min, args.eta_mask_max)
 
                 imgs = inpaint(
@@ -528,7 +522,7 @@ def main():
                     guidance_scale_inside=(args.guidance_scale_inside if args.guidance_scale_inside is not None else 3.0),
                     guidance_scale_outside=(args.guidance_scale_outside if args.guidance_scale_outside is not None else 7.5),
 
-                    # NEW: inside 스케줄/샘플링 옵션 전달
+                    # NEW: inside
                     gsi_use_schedule=args.gsi_use_schedule,
                     gsi_schedule=args.gsi_schedule,
                     gsi_min=args.gsi_min,
@@ -551,4 +545,3 @@ if __name__ == "__main__":
     main()
 
 
-# CUDA_VISIBLE_DEVICES=3 python inference_guidance_scale_scheduler_up_cc.py --model_ckpt_root='./model/dreambooth_batch_4_5000_noise_1.0_0.33' --text_noise_scale 1.0 --defect_json ./datasets/defect_classification_final_mvtec.json --match_json ./datasets/mvtec_multi_region_matching.json --normal_masks ./foreground_mask/mvtec_normal_foreground --output_name ./generated_image/mvtec/guidance_scale/noise_rand_flip_black_flitering_0/cosine_up --mask_dir ./anomaly_masks/mvtec/noise_rand_flip_black_flitering_0_512 --ddim_scheduler_root ./scheduler --dataset_type mvtec --gsi_use_schedule --gsi_schedule cosine --gsi_min 4.0 --gsi_max 7.5 --guidance_scale_outside 7.5 --CAMA --base_dir ./data/mvtecad
