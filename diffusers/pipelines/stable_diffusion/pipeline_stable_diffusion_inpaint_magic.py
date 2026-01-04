@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import math, random  # ★ NEW: inside guidance scheduling / sampling
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import PIL.Image
@@ -111,7 +112,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusionInpaintPipeline_magic(
+class StableDiffusionInpaintPipeline_dynamic(
     DiffusionPipeline,
     StableDiffusionMixin,
     TextualInversionLoaderMixin,
@@ -558,19 +559,25 @@ class StableDiffusionInpaintPipeline_magic(
                 images=image, clip_input=safety_checker_input.pixel_values.to(dtype)
             )
         return image, has_nsfw_concept
+
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta, anomaly_strength=0.0):
+        # 기존 DDIM용 extra kwargs + anomaly_strength 추가
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
         extra_step_kwargs = {}
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
-        
+
+        # scheduler.step에서 generator 지원 여부 확인
         accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
         if accepts_generator:
             extra_step_kwargs["generator"] = generator
 
+        # [추가] anomaly_strength를 extra_step_kwargs에 포함
         extra_step_kwargs["anomaly_strength"] = anomaly_strength
 
         return extra_step_kwargs
+
     def check_inputs(
         self,
         prompt,
@@ -653,9 +660,7 @@ class StableDiffusionInpaintPipeline_magic(
 
         if ip_adapter_image_embeds is not None:
             if not isinstance(ip_adapter_image_embeds, list):
-                raise ValueError(
-                    f"`ip_adapter_image_embeds` has to be of type `list` but is {type(ip_adapter_image_embeds)}"
-                )
+                raise ValueError(f"`ip_adapter_image_embeds` has to be of type `list` but is {type(ip_adapter_image_embeds)}")
             elif ip_adapter_image_embeds[0].ndim not in [3, 4]:
                 raise ValueError(
                     f"`ip_adapter_image_embeds` has to be a list of 3D or 4D tensors but is {ip_adapter_image_embeds[0].ndim}D"
@@ -770,7 +775,6 @@ class StableDiffusionInpaintPipeline_magic(
                 raise ValueError(
                     "The passed images and the required batch size don't match. Images are supposed to be duplicated"
                     f" to a total batch size of {batch_size}, but {masked_image_latents.shape[0]} images were passed."
-                    " Make sure the number of images that you pass is divisible by the total requested batch size."
                 )
             masked_image_latents = masked_image_latents.repeat(batch_size // masked_image_latents.shape[0], 1, 1, 1)
 
@@ -853,6 +857,35 @@ class StableDiffusionInpaintPipeline_magic(
     def interrupt(self):
         return self._interrupt
 
+    # ---- NEW: inside guidance 스케줄 함수 ----
+    def _gsi_shape(self, schedule: str, s: float, power: float, exp_k: float, sigmoid_k: float) -> float:
+        """
+        0..1 → 0..1 가중치. 'down'은 s=0일 때 1, s=1일 때 0이 되도록 설계.
+        schedule이 'cosine','linear','poly','exp','sigmoid'처럼 suffix 없음으로 들어오면 'down'으로 간주.
+        """
+        s = max(0.0, min(1.0, s))
+        sch = (schedule or "linear").lower()
+        # suffix normalize: (기본 down)
+        if sch in ["linear", "cosine", "poly", "exp", "sigmoid", "constant"]:
+            if sch != "constant":
+                sch = f"{sch}_down"
+
+        if sch == "constant":
+            return 1.0
+        if sch == "linear_down":
+            return 1.0 - s
+        if sch == "cosine_down":
+            return 0.5 * (1.0 + math.cos(math.pi * s))
+        if sch == "poly_down":
+            return (1.0 - s) ** max(power, 1e-6)
+        if sch == "exp_down":
+            return math.exp(-exp_k * s)
+        if sch == "sigmoid_down":
+            sig = 1.0 / (1.0 + math.exp(sigmoid_k * (s - 0.5)))
+            return max(0.0, min(1.0, (sig - 0.5) / 0.5))
+        # fallback
+        return 1.0
+
     @torch.no_grad()
     def __call__(
         self,
@@ -868,6 +901,9 @@ class StableDiffusionInpaintPipeline_magic(
         timesteps: List[int] = None,
         sigmas: List[float] = None,
         guidance_scale: float = 7.5,
+        # NEW: spatial guidance scales
+        guidance_scale_inside: Optional[float] = None,   # 스케줄/샘플링 미사용 시 스칼라 fallback
+        guidance_scale_outside: Optional[float] = None,  # 항상 스칼라 유지(미지정이면 global guidance_scale 사용)
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
@@ -887,14 +923,25 @@ class StableDiffusionInpaintPipeline_magic(
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         anomaly_strength: float = 0.0,
         anomaly_stop_step: int = 999999,
+        eta_mask_stop_step: int = 999999,
         use_random_mask = False,
+        eta_mask: float = 0.0,
+
+        # ---- NEW: inside guidance 스케줄/샘플링 옵션 ----
+        gsi_use_schedule: bool = False,
+        gsi_schedule: str = "linear",
+        guidance_scale_inside_min: Optional[float] = None,
+        guidance_scale_inside_max: Optional[float] = None,
+        gsi_power: float = 2.0,
+        gsi_exp_k: float = 3.0,
+        gsi_sigmoid_k: float = 8.0,
+        gsi_sample_per_step: bool = False,
         **kwargs,
     ):
-
         device = self._execution_device
         do_classifier_free_guidance = (guidance_scale > 1.0)
 
-
+        # (a) height/width default
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
@@ -920,13 +967,11 @@ class StableDiffusionInpaintPipeline_magic(
         else:
             masked_image = masked_image_latents
 
-
         batch_size = init_image.shape[0]
         num_channels_latents = self.vae.config.latent_channels
-
+        # (a) vae encode init_image
         init_image_latents = self.vae.encode(init_image).latent_dist.sample(generator=generator)
         init_image_latents = self.vae.config.scaling_factor * init_image_latents
-
 
         if latents is None:
             noise = randn_tensor(
@@ -936,11 +981,11 @@ class StableDiffusionInpaintPipeline_magic(
             if strength == 1.0:
                 latents = noise * self.scheduler.init_noise_sigma
             else:
-                latents = noise 
+                latents = noise
         else:
             latents = latents.to(device)
 
-
+        # (c) mask/ masked_image_latents => vae encode
         mask = self.mask_processor.preprocess(
             mask_image, height=height, width=width, resize_mode=resize_mode, crops_coords=crops_coords
         )
@@ -983,71 +1028,100 @@ class StableDiffusionInpaintPipeline_magic(
         timesteps, num_inference_steps = self.scheduler.set_timesteps(num_inference_steps, device=device), num_inference_steps
         # e.g. self.scheduler.init_noise_sigma, ...
 
-
         # ---------------------------------------------------
         # 6) extra_step_kwargs + mask_for_anomaly
         # ---------------------------------------------------
+        step_params = set(inspect.signature(self.scheduler.step).parameters.keys())
         extra_step_kwargs = {}
-        if "eta" in inspect.signature(self.scheduler.step).parameters:
+        if "eta" in step_params:
             extra_step_kwargs["eta"] = eta
-        # if "anomaly_strength" in inspect.signature(self.scheduler.step).parameters:
-        #     extra_step_kwargs["anomaly_strength"] = anomaly_strength
-        if "generator" in inspect.signature(self.scheduler.step).parameters:
+        if "generator" in step_params:
             extra_step_kwargs["generator"] = generator
 
-        extra_step_kwargs["mask_for_anomaly"] = mask  # (2B,1,H,W) or (B,1,H,W)
+        accepts_eta_mask       = ("eta_mask" in step_params)
+        accepts_anomaly        = ("anomaly_strength" in step_params)
+        accepts_mask_for_anom  = ("mask_for_anomaly" in step_params)
+        accepts_use_random     = ("use_random_mask" in step_params)
 
-        # ---------------------------------------------------
-        # 7) Denoising loop
-        # ---------------------------------------------------
+        # ---- NEW: inside/outside guidance 설정 준비 ----
+        # outside는 스칼라 그대로 사용(미지정 시 global guidance_scale 사용)
+        gs_out_scalar = float(guidance_scale_outside) if (guidance_scale_outside is not None) else float(guidance_scale)
+
+        use_gsi_schedule = bool(gsi_use_schedule and (guidance_scale_inside_min is not None) and (guidance_scale_inside_max is not None))
+        use_gsi_sampling = bool((not use_gsi_schedule) and gsi_sample_per_step and (guidance_scale_inside_min is not None) and (guidance_scale_inside_max is not None))
+
+        # (7) Denoising loop
         with self.progress_bar(total=num_inference_steps) as pbar:
             for i, t in enumerate(self.scheduler.timesteps):
-                # import pdb;pdb.set_trace()
-                if i < anomaly_stop_step:
-                    anomaly_strength_current = anomaly_strength
-                else:
-                    anomaly_strength_current = 0.0
-                # scale input
+                anomaly_strength_current = anomaly_strength if i < anomaly_stop_step else 0.0
+                step_eta_mask = eta_mask if i < eta_mask_stop_step else 0.0
+
                 latent_model_input = self.scheduler.scale_model_input(latents, t)
-                
-                # inpaint => 9ch
+
                 if self.unet.config.in_channels == 9:
                     unet_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
                 else:
                     unet_input = latent_model_input
 
-                # forward unet => shape(...,4,...)
                 noise_pred = self.unet(
-                    unet_input,
-                    t,
+                    unet_input, t,
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                     return_dict=False,
                 )[0]
 
-                # guidance
                 if do_classifier_free_guidance:
                     half = noise_pred.shape[0] // 2
                     noise_pred_uncond, noise_pred_cond = noise_pred[:half], noise_pred[half:]
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                # step => latents, shape same => (2B,4,...) or (B,4,...)
-                # import pdb;pdb.set_trace()
-                latents = self.scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    **extra_step_kwargs,
-                    anomaly_strength=anomaly_strength_current,
-                    use_random_mask=use_random_mask,
-                    return_dict=False
-                )[0]
+                    # === NEW: Spatial CFG with inside scheduling / per-step sampling ===
+                    # inside 스칼라 결정 (스케줄 > 샘플링 > 스칼라 fallback 순서)
+                    if use_gsi_schedule:
+                        s = 0.0 if (num_inference_steps <= 1) else (i / float(num_inference_steps - 1))  # 0→1
+                        w01_down = self._gsi_shape(gsi_schedule, s, gsi_power, gsi_exp_k, gsi_sigmoid_k)  # 1→0 (down)
+                        w01_up = 1.0 - w01_down  # ★ CHANGED: 0→1 (up) 로 변환
+                        gsi_min = float(guidance_scale_inside_min)
+                        gsi_max = float(guidance_scale_inside_max)
+                        # ★ CHANGED: w01_up=0(첫 스텝)→min, w01_up=1(마지막)→max : min→max 선형 보간
+                        gs_in_scalar = gsi_min + (gsi_max - gsi_min) * w01_up
+                    elif use_gsi_sampling:
+                        gs_in_scalar = random.uniform(float(guidance_scale_inside_min), float(guidance_scale_inside_max))
+                    else:
+                        base = guidance_scale_inside if (guidance_scale_inside is not None) else guidance_scale
+                        gs_in_scalar = float(base)
 
+                    # spatial guidance 적용: cond 배치의 마스크 사용
+                    mask_cond = mask[half:]  # (B,1,H,W)
+                    # import pdb;pdb.set_trace()
+                    gs_in  = torch.as_tensor(gs_in_scalar,  device=noise_pred.device, dtype=noise_pred.dtype)
+                    gs_out = torch.as_tensor(gs_out_scalar, device=noise_pred.device, dtype=noise_pred.dtype)
+                    guidance_map = (gs_out * (1.0 - mask_cond)) + (gs_in * mask_cond)  # (B,1,H,W)
+
+                    # 채널 브로드캐스트
+                    if guidance_map.shape[1] != noise_pred_cond.shape[1]:
+                        guidance_map = guidance_map.expand(-1, noise_pred_cond.shape[1], -1, -1)
+
+                    noise_pred = noise_pred_uncond + guidance_map * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    # guidance_scale<=1인 경우 CFG 미사용
+                    noise_pred = noise_pred
+
+                # 스텝별 kwargs
+                step_kwargs = dict(extra_step_kwargs)
+                if accepts_eta_mask:
+                    step_kwargs["eta_mask"] = step_eta_mask
+                if accepts_mask_for_anom:
+                    step_kwargs["mask_for_anomaly"] = mask
+                if accepts_anomaly:
+                    step_kwargs["anomaly_strength"] = anomaly_strength_current
+                if accepts_use_random:
+                    step_kwargs["use_random_mask"] = use_random_mask
+                step_kwargs["return_dict"] = False
+
+                latents = self.scheduler.step(noise_pred, t, latents, **step_kwargs)[0]
                 pbar.update()
 
-
         if do_classifier_free_guidance:
-
             half = latents.shape[0] // 2
             latents = latents[half:]
 
